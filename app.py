@@ -3,15 +3,108 @@ import subprocess
 import sys
 import tempfile
 import gradio as gr
-from pathlib import Path
+from flask import Flask, request, jsonify, redirect
+import requests
+import threading
+import secrets 
 
-# OpenAI API key is expected in environment
+# Load .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ .env loaded")
+except:
+    print("ℹ️ dotenv not installed – using system env")
+
+# Global storage for the token
+github_token_storage = {"token": None}
+
+# Environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY not set – AI features will fail")
+if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+    print("⚠️ GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET not set – OAuth will not work")
 
+# Flask app
+flask_app = Flask(__name__)
+flask_app.secret_key = secrets.token_hex(32)
+
+# ----------------------------
+# Flask OAuth routes
+# ----------------------------
+@flask_app.route("/oauth/login")
+def oauth_login():
+    """Redirect user to GitHub for authorization."""
+    if not GITHUB_CLIENT_ID:
+        return "GitHub OAuth not configured", 400
+    # Redirect URI must match the one registered in GitHub OAuth app
+    redirect_uri = "http://localhost:5000/oauth/callback"  # change for production
+    return redirect(
+        f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&redirect_uri={redirect_uri}&scope=repo"
+    )
+
+@flask_app.route("/oauth/callback")
+def oauth_callback():
+    """GitHub redirects here after user authorization."""
+    code = request.args.get("code")
+    if not code:
+        return "No code provided", 400
+
+    # Exchange code for access token
+    response = requests.post(
+        "https://github.com/login/oauth/access_token",
+        data={
+            "client_id": GITHUB_CLIENT_ID,
+            "client_secret": GITHUB_CLIENT_SECRET,
+            "code": code,
+        },
+        headers={"Accept": "application/json"},
+    )
+    if response.status_code != 200:
+        return "Failed to get token", 400
+
+    data = response.json()
+    token = data.get("access_token")
+    if not token:
+        return "No token in response", 400
+
+    # Store the token globally
+    github_token_storage["token"] = token
+    print(f"✅ GitHub token stored (length: {len(token)})")
+
+    # Return success page (you can redirect to your app)
+    return """
+    <html>
+    <body>
+        <h2>✅ GitHub connected successfully!</h2>
+        <p>You can close this window and return to the SEO tool.</p>
+        <script>window.close();</script>
+    </body>
+    </html>
+    """
+
+# Keep the /set-token endpoint for backward compatibility (optional)
+@flask_app.route("/set-token", methods=["POST"])
+def set_token():
+    data = request.get_json()
+    if not data or "token" not in data:
+        return jsonify({"error": "Missing token"}), 400
+    github_token_storage["token"] = data["token"]
+    print(f"✅ Token received via /set-token (length: {len(data['token'])})")
+    return jsonify({"status": "success"})
+
+@flask_app.route("/token-status", methods=["GET"])
+def token_status():
+    return jsonify({"has_token": github_token_storage["token"] is not None})
+
+# ----------------------------
+# Gradio function (unchanged)
+# ----------------------------
 def run_seo_fix(
-    github_token: str,
     repo_url: str,
     branch: str,
     site_base: str,
@@ -19,33 +112,28 @@ def run_seo_fix(
     git_email: str,
     csv_file
 ) -> str:
-    """
-    Run the SEO auto-fix process.
-    """
     if not OPENAI_API_KEY:
-        return "❌ OPENAI_API_KEY not set. Please add it to your environment."
+        return "❌ OPENAI_API_KEY not set. Add it to .env."
 
-    # Validate inputs
-    if not github_token or not repo_url or not site_base:
-        return "❌ GitHub token, repository URL, and site base URL are required."
+    github_token = github_token_storage.get("token")
+    if not github_token:
+        return "❌ GitHub token not received. Click 'Connect GitHub' first."
 
-    # Handle CSV upload
+    if not repo_url or not site_base:
+        return "❌ Repository URL and site base URL are required."
+
     csv_path = None
     if csv_file is not None:
-        # csv_file is a temporary file object from Gradio
         try:
             with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.csv') as f:
-                # csv_file.name is the path to the uploaded file
                 with open(csv_file.name, 'rb') as src:
                     f.write(src.read())
                 csv_path = f.name
         except Exception as e:
             return f"❌ Error processing CSV file: {str(e)}"
     else:
-        # Use default path if no CSV uploaded (main_script.py expects CSV_PATH)
         csv_path = "seo_report.csv"
 
-    # Prepare environment for subprocess
     env = os.environ.copy()
     env.update({
         "GITHUB_TOKEN": github_token,
@@ -54,52 +142,54 @@ def run_seo_fix(
         "SITE_BASE": site_base,
         "GIT_USERNAME": git_username,
         "GIT_EMAIL": git_email,
-        "CSV_PATH": csv_path
+        "CSV_PATH": csv_path,
+        "OPENAI_API_KEY": OPENAI_API_KEY,
     })
 
     try:
-        # Run the main script
         proc = subprocess.run(
             [sys.executable, "main_script.py"],
             env=env,
             capture_output=True,
             text=True,
-            timeout=300  # 5 minutes
+            timeout=300
         )
-
         output = f"Return code: {proc.returncode}\n"
         output += f"Success: {'✅' if proc.returncode == 0 else '❌'}\n\n"
         output += "STDOUT:\n" + proc.stdout + "\n"
         if proc.stderr:
             output += "STDERR:\n" + proc.stderr + "\n"
-
-        # Clean up temp CSV if created
         if csv_path and csv_path.startswith(tempfile.gettempdir()):
             try:
                 os.unlink(csv_path)
             except:
                 pass
-
         return output
-
     except subprocess.TimeoutExpired:
         return "❌ Process timed out after 5 minutes."
     except Exception as e:
         return f"❌ Unexpected error: {str(e)}"
 
-# Build Gradio interface
+# ----------------------------
+# Gradio UI (no token input)
+# ----------------------------
 with gr.Blocks(title="SEO Auto-Fix Agent") as demo:
     gr.Markdown("# 🚀 SEO Auto-Fix Agent")
     gr.Markdown("AI‑powered SEO optimization for your GitHub repositories")
 
+    status = gr.Markdown("**GitHub Status:** ❌ Not connected")
+
     with gr.Row():
         with gr.Column(scale=1):
-            github_token = gr.Textbox(
-                label="GitHub Token",
-                type="password",
-                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx",
-                info="Create at GitHub Settings → Developer settings → Personal access tokens"
-            )
+            # "Connect GitHub" button – links to Flask OAuth
+            gr.HTML(f'''
+                <a href="http://localhost:5000/oauth/login" target="_blank">
+                    <button style="padding:10px 20px;background:#24292e;color:white;border:none;border-radius:6px;cursor:pointer;font-size:16px;">
+                        🔑 Connect GitHub
+                    </button>
+                </a>
+            ''')
+
             repo_url = gr.Textbox(
                 label="Repository URL",
                 placeholder="https://github.com/username/repository"
@@ -135,22 +225,220 @@ with gr.Blocks(title="SEO Auto-Fix Agent") as demo:
                 placeholder="Results will appear here..."
             )
 
+    def update_status():
+        token = github_token_storage.get("token")
+        if token:
+            return "**GitHub Status:** ✅ Connected (Token available)"
+        else:
+            return "**GitHub Status:** ❌ Not connected – click 'Connect GitHub' above."
+
+    run_btn.click(fn=update_status, inputs=[], outputs=status)
     run_btn.click(
         fn=run_seo_fix,
-        inputs=[
-            github_token,
-            repo_url,
-            branch,
-            site_base,
-            git_username,
-            git_email,
-            csv_file
-        ],
+        inputs=[repo_url, branch, site_base, git_username, git_email, csv_file],
         outputs=output
     )
 
+# ----------------------------
+# Run both servers
+# ----------------------------
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    gradio_port = int(os.environ.get("GRADIO_PORT", 7860))
+    flask_port = int(os.environ.get("FLASK_PORT", 5000))
+
+    def run_flask():
+        flask_app.run(host="127.0.0.1", port=flask_port, debug=False, use_reloader=False)
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    demo.launch(server_name="127.0.0.1", server_port=gradio_port)
+
+
+
+# import os
+# import subprocess
+# import sys
+# import tempfile
+# import gradio as gr
+# from pathlib import Path
+
+# # OpenAI API key is expected in environment
+# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# if not OPENAI_API_KEY:
+#     print("⚠️ OPENAI_API_KEY not set – AI features will fail")
+
+# def run_seo_fix(
+#     github_token: str,
+#     repo_url: str,
+#     branch: str,
+#     site_base: str,
+#     git_username: str,
+#     git_email: str,
+#     csv_file
+# ) -> str:
+#     """
+#     Run the SEO auto-fix process.
+#     """
+#     if not OPENAI_API_KEY:
+#         return "❌ OPENAI_API_KEY not set. Please add it to your environment."
+
+#     # Validate inputs
+#     if not github_token or not repo_url or not site_base:
+#         return "❌ GitHub token, repository URL, and site base URL are required."
+
+#     # Handle CSV upload
+#     csv_path = None
+#     if csv_file is not None:
+#         # csv_file is a temporary file object from Gradio
+#         try:
+#             with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.csv') as f:
+#                 # csv_file.name is the path to the uploaded file
+#                 with open(csv_file.name, 'rb') as src:
+#                     f.write(src.read())
+#                 csv_path = f.name
+#         except Exception as e:
+#             return f"❌ Error processing CSV file: {str(e)}"
+#     else:
+#         # Use default path if no CSV uploaded (main_script.py expects CSV_PATH)
+#         csv_path = "seo_report.csv"
+
+#     # Prepare environment for subprocess
+#     env = os.environ.copy()
+#     env.update({
+#         "GITHUB_TOKEN": github_token,
+#         "REPO_URL": repo_url,
+#         "BRANCH": branch,
+#         "SITE_BASE": site_base,
+#         "GIT_USERNAME": git_username,
+#         "GIT_EMAIL": git_email,
+#         "CSV_PATH": csv_path
+#     })
+
+#     try:
+#         # Run the main script
+#         proc = subprocess.run(
+#             [sys.executable, "main_script.py"],
+#             env=env,
+#             capture_output=True,
+#             text=True,
+#             timeout=300  # 5 minutes
+#         )
+
+#         output = f"Return code: {proc.returncode}\n"
+#         output += f"Success: {'✅' if proc.returncode == 0 else '❌'}\n\n"
+#         output += "STDOUT:\n" + proc.stdout + "\n"
+#         if proc.stderr:
+#             output += "STDERR:\n" + proc.stderr + "\n"
+
+#         # Clean up temp CSV if created
+#         if csv_path and csv_path.startswith(tempfile.gettempdir()):
+#             try:
+#                 os.unlink(csv_path)
+#             except:
+#                 pass
+
+#         return output
+
+#     except subprocess.TimeoutExpired:
+#         return "❌ Process timed out after 5 minutes."
+#     except Exception as e:
+#         return f"❌ Unexpected error: {str(e)}"
+
+# # Build Gradio interface
+# with gr.Blocks(title="SEO Auto-Fix Agent") as demo:
+#     gr.Markdown("# 🚀 SEO Auto-Fix Agent")
+#     gr.Markdown("AI‑powered SEO optimization for your GitHub repositories")
+
+#     with gr.Row():
+#         with gr.Column(scale=1):
+#             github_token = gr.Textbox(
+#                 label="GitHub Token",
+#                 type="password",
+#                 placeholder="ghp_xxxxxxxxxxxxxxxxxxxx",
+#                 info="Create at GitHub Settings → Developer settings → Personal access tokens"
+#             )
+#             repo_url = gr.Textbox(
+#                 label="Repository URL",
+#                 placeholder="https://github.com/username/repository"
+#             )
+#             branch = gr.Textbox(
+#                 label="Branch",
+#                 value="main"
+#             )
+#             site_base = gr.Textbox(
+#                 label="Site Base URL",
+#                 placeholder="https://yoursite.com"
+#             )
+#             git_username = gr.Textbox(
+#                 label="Git Username",
+#                 value="SEO-Auto-Fix-Bot"
+#             )
+#             git_email = gr.Textbox(
+#                 label="Git Email",
+#                 value="seo-bot@example.com"
+#             )
+#             csv_file = gr.File(
+#                 label="SEO Report CSV (optional)",
+#                 file_types=[".csv"]
+#             )
+
+#             run_btn = gr.Button("🚀 Run SEO Auto-Fix", variant="primary")
+
+#         with gr.Column(scale=1):
+#             output = gr.Textbox(
+#                 label="Output Log",
+#                 lines=20,
+#                 interactive=False,
+#                 placeholder="Results will appear here..."
+#             )
+
+#     run_btn.click(
+#         fn=run_seo_fix,
+#         inputs=[
+#             github_token,
+#             repo_url,
+#             branch,
+#             site_base,
+#             git_username,
+#             git_email,
+#             csv_file
+#         ],
+#         outputs=output
+#     )
+
+
+# if __name__ == "__main__":
+#     demo.launch(server_name="127.0.0.1", server_port=7860)
+
+
+
+
+
+# if __name__ == "__main__":
+#     demo.launch(server_name="0.0.0.0", server_port=7860)
+
+
+# if __name__ == "__main__":
+#     import os
+#     port = int(os.environ.get("PORT", 7860))
+#     demo.launch(server_name="0.0.0.0", server_port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
